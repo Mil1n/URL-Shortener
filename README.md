@@ -42,7 +42,11 @@
 - Кастомный slug.
 - Поддержка `expires_at`.
 - Детекция ботов по User-Agent.
-- Метрики: `total_clicks`, `unique_clicks`, `bot_clicks`.
+- Метрики: `total_clicks`, `unique_clicks`, `bot_clicks`, `bot_ratio`, `top_referrers`, `clicks_by_day`, `recent_clicks`.
+- Валидация slug, destination URL и `expires_at`.
+- Список, обновление, отключение ссылок и CSV-импорт.
+- UTM-builder, preview endpoint и SVG-код для шаринга ссылки.
+- Простые in-memory rate limits для API и редиректов.
 
 ---
 
@@ -87,11 +91,12 @@ python src/server.py
 - `PORT` — порт сервера (по умолчанию `8080`)
 - `SHORTENER_DB_PATH` — путь к SQLite БД (по умолчанию `shortener.db`)
 - `SHORTENER_API_KEY` — API-ключ (по умолчанию `dev-secret-key`)
+- `SHORTENER_BASE_URL` — базовый публичный URL для генерации `short_url` (опционально)
 
 Пример запуска с кастомными переменными:
 
 ```bash
-SHORTENER_API_KEY=my-super-key SHORTENER_DB_PATH=./data/shortener.db PORT=9000 python src/server.py
+SHORTENER_API_KEY=my-super-key SHORTENER_DB_PATH=./data/shortener.db SHORTENER_BASE_URL=https://go.example.com PORT=9000 python src/server.py
 ```
 
 ---
@@ -151,8 +156,60 @@ curl http://127.0.0.1:8080/api/links/launch2026/stats \
   "slug": "launch2026",
   "total_clicks": 42,
   "unique_clicks": 31,
-  "bot_clicks": 4
+  "bot_clicks": 4,
+  "bot_ratio": 0.0952,
+  "top_referrers": [
+    {"referrer":"https://example.com","clicks":20}
+  ],
+  "clicks_by_day": [
+    {"date":"2026-06-28","clicks":42}
+  ],
+  "recent_clicks": []
 }
+```
+
+
+### Список ссылок
+
+```bash
+curl http://127.0.0.1:8080/api/links \
+  -H 'X-API-Key: dev-secret-key'
+```
+
+### Обновление ссылки
+
+```bash
+curl -X PATCH http://127.0.0.1:8080/api/links/launch2026 \
+  -H 'Content-Type: application/json' \
+  -H 'X-API-Key: dev-secret-key' \
+  -d '{
+    "is_active": false,
+    "expires_at": "2026-12-31T23:59:59+00:00"
+  }'
+```
+
+### Отключение ссылки
+
+```bash
+curl -X DELETE http://127.0.0.1:8080/api/links/launch2026 \
+  -H 'X-API-Key: dev-secret-key'
+```
+
+### CSV-импорт
+
+CSV должен содержать минимум колонки `destination_url` и, опционально, `slug`, `expires_at`, `utm_source`, `utm_medium`, `utm_campaign`, `utm_content`, `utm_term`.
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/links/import \
+  -H 'X-API-Key: dev-secret-key' \
+  --data-binary @links.csv
+```
+
+### Preview и SVG-код для шаринга
+
+```bash
+curl http://127.0.0.1:8080/preview/launch2026
+curl http://127.0.0.1:8080/qr/launch2026 > launch2026.svg
 ```
 
 ### Пример ссылки со сроком действия
