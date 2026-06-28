@@ -49,6 +49,8 @@
   - устройства.
 - Простейшая антибот-фильтрация по user-agent + rate limit.
 - API-ключи для доступа к API.
+- Управление ссылками: список, обновление, отключение.
+- CSV-импорт, UTM-builder, preview и SVG-код для шаринга короткой ссылки.
 
 ## Growth-фаза
 
@@ -115,7 +117,7 @@
 
 ## 8) Roadmap на 12 недель
 
-- **Неделя 1–2**: Core API + redirect + SQLite/Postgres + API keys.
+- **Неделя 1–2**: Core API + redirect + SQLite/Postgres + API keys + hardening URL/slug/expires_at.
 - **Неделя 3–4**: Dashboard analytics + referrer/device разрезы.
 - **Неделя 5–6**: Anti-bot v1 + rate limit + abuse alerts.
 - **Неделя 7–8**: A/B routing + QR + CSV import.
