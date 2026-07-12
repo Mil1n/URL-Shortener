@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import unittest
+from urllib.parse import urlsplit
 
 os.environ["SHORTENER_API_KEY"] = "test-key"
 
@@ -26,9 +27,11 @@ class ServerTest(unittest.TestCase):
         payload = b""
         if body is not None:
             payload = json.dumps(body).encode("utf-8")
+        parsed_path = urlsplit(path)
         environ = {
             "REQUEST_METHOD": method,
-            "PATH_INFO": path,
+            "PATH_INFO": parsed_path.path,
+            "QUERY_STRING": parsed_path.query,
             "wsgi.input": io.BytesIO(payload),
             "CONTENT_LENGTH": str(len(payload)),
             "REMOTE_ADDR": remote_addr,
@@ -133,6 +136,69 @@ class ServerTest(unittest.TestCase):
         qr = self.request("GET", "/qr/csv-link")
         self.assertTrue(qr["status"].startswith("200"))
         self.assertEqual(qr["headers"]["Content-Type"], "image/svg+xml; charset=utf-8")
+
+    def test_ab_routing_enriched_stats_filters_and_dashboard(self):
+        created = self.request(
+            "POST",
+            "/api/links",
+            {
+                "destination_url": "https://example.com/control",
+                "slug": "ab-link",
+                "destinations": [
+                    {"label": "a", "url": "https://example.com/a", "weight": 1},
+                    {"label": "b", "url": "https://example.com/b", "weight": 1},
+                ],
+            },
+            self.api_headers(),
+        )
+        body = json.loads(created["body"])
+        self.assertTrue(created["status"].startswith("201"))
+        self.assertEqual(len(body["destinations"]), 3)
+
+        redirect = self.request(
+            "GET",
+            "/ab-link",
+            headers={"HTTP_USER_AGENT": "Mozilla/5.0 (iPhone) Safari/605.1", "HTTP_CF_IPCOUNTRY": "US"},
+        )
+        self.assertTrue(redirect["status"].startswith("302"))
+        self.assertIn(redirect["headers"]["Location"], {"https://example.com/control", "https://example.com/a", "https://example.com/b"})
+
+        stats = self.request("GET", "/api/links/ab-link/stats", headers=self.api_headers())
+        stats_body = json.loads(stats["body"])
+        self.assertEqual(stats_body["devices"][0]["name"], "mobile")
+        self.assertEqual(stats_body["countries"][0]["name"], "US")
+        self.assertTrue(stats_body["variants"])
+
+        listed = self.request("GET", "/api/links?q=ab-link&limit=10&offset=0&is_active=true", headers=self.api_headers())
+        listed_body = json.loads(listed["body"])
+        self.assertEqual(listed_body["pagination"]["total"], 1)
+        self.assertEqual(listed_body["links"][0]["slug"], "ab-link")
+
+        dashboard = self.request("GET", "/admin", headers=self.api_headers())
+        self.assertTrue(dashboard["status"].startswith("200"))
+        self.assertIn(b"Links dashboard", dashboard["body"])
+
+    def test_api_keys_and_webhooks(self):
+        key = self.request(
+            "POST",
+            "/api/keys",
+            {"name": "readonly", "scopes": ["links:read", "stats:read"]},
+            self.api_headers(),
+        )
+        self.assertTrue(key["status"].startswith("201"))
+        api_key = json.loads(key["body"])["api_key"]
+
+        allowed = self.request("GET", "/api/links", headers={"HTTP_X_API_KEY": api_key})
+        self.assertTrue(allowed["status"].startswith("200"))
+
+        denied = self.request("POST", "/api/links", {"destination_url": "https://example.com", "slug": "nope"}, {"HTTP_X_API_KEY": api_key})
+        self.assertTrue(denied["status"].startswith("401"))
+
+        webhook = self.request("POST", "/api/webhooks", {"url": "https://example.com/hook", "events": ["click.created"]}, self.api_headers())
+        self.assertTrue(webhook["status"].startswith("201"))
+        webhook_body = json.loads(webhook["body"])
+        self.assertEqual(webhook_body["events"], ["click.created"])
+        self.assertTrue(webhook_body["secret"])
 
 
 if __name__ == "__main__":

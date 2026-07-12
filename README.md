@@ -47,6 +47,12 @@
 - Список, обновление, отключение ссылок и CSV-импорт.
 - UTM-builder, preview endpoint и SVG-код для шаринга ссылки.
 - Простые in-memory rate limits для API и редиректов.
+- A/B routing с весами destination URL.
+- Расширенная аналитика по устройствам, браузерам, ОС, странам и вариантам A/B.
+- Фильтры, поиск и пагинация списка ссылок.
+- API-ключи в БД со scopes и workspace-контекстом.
+- Webhooks для событий кликов и простой HTML dashboard.
+- Safety hints для подозрительных destination URL.
 
 ---
 
@@ -92,6 +98,8 @@ python src/server.py
 - `SHORTENER_DB_PATH` — путь к SQLite БД (по умолчанию `shortener.db`)
 - `SHORTENER_API_KEY` — API-ключ (по умолчанию `dev-secret-key`)
 - `SHORTENER_BASE_URL` — базовый публичный URL для генерации `short_url` (опционально)
+- `SHORTENER_WORKSPACE_ID` — workspace по умолчанию для legacy API-ключа (по умолчанию `default`)
+- `SHORTENER_WEBHOOK_TIMEOUT` — timeout доставки webhook в секундах (по умолчанию `2`)
 
 Пример запуска с кастомными переменными:
 
@@ -211,6 +219,65 @@ curl -X POST http://127.0.0.1:8080/api/links/import \
 curl http://127.0.0.1:8080/preview/launch2026
 curl http://127.0.0.1:8080/qr/launch2026 > launch2026.svg
 ```
+
+
+### A/B routing
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/links \
+  -H 'Content-Type: application/json' \
+  -H 'X-API-Key: dev-secret-key' \
+  -d '{
+    "destination_url":"https://example.com/control",
+    "slug":"experiment",
+    "destinations":[
+      {"label":"a","url":"https://example.com/a","weight":50},
+      {"label":"b","url":"https://example.com/b","weight":50}
+    ]
+  }'
+```
+
+При редиректе сервис выбирает destination URL с учётом веса и сохраняет `variant_label` в аналитике.
+
+### Фильтры списка ссылок
+
+```bash
+curl 'http://127.0.0.1:8080/api/links?q=launch&limit=20&offset=0&is_active=true' \
+  -H 'X-API-Key: dev-secret-key'
+```
+
+Ответ содержит `links` и блок `pagination` с `limit`, `offset` и `total`.
+
+### API-ключи со scopes
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/keys \
+  -H 'Content-Type: application/json' \
+  -H 'X-API-Key: dev-secret-key' \
+  -d '{"name":"readonly","scopes":["links:read","stats:read"]}'
+```
+
+Созданный ключ возвращается только один раз; в SQLite хранится SHA-256 hash.
+
+### Webhooks
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/webhooks \
+  -H 'Content-Type: application/json' \
+  -H 'X-API-Key: dev-secret-key' \
+  -d '{"url":"https://example.com/hook","events":["click.created"]}'
+```
+
+Payload подписывается HMAC SHA-256 в заголовке `X-Shortener-Signature`.
+
+### Dashboard
+
+```bash
+curl http://127.0.0.1:8080/admin \
+  -H 'X-API-Key: dev-secret-key'
+```
+
+Dashboard показывает последние 50 ссылок, статус активности и safety hint.
 
 ### Пример ссылки со сроком действия
 
