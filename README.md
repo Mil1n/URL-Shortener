@@ -42,11 +42,17 @@
 - Кастомный slug.
 - Поддержка `expires_at`.
 - Детекция ботов по User-Agent.
-- Метрики: `total_clicks`, `unique_clicks`, `bot_clicks`, `bot_ratio`, `top_referrers`, `clicks_by_day`, `recent_clicks`.
+- Метрики: `total_clicks`, `unique_clicks`, `bot_clicks`, `bot_ratio`, `top_referrers`, `clicks_by_day`; `recent_clicks` доступны по явному флагу.
 - Валидация slug, destination URL и `expires_at`.
 - Список, обновление, отключение ссылок и CSV-импорт.
-- UTM-builder, preview endpoint и SVG-код для шаринга ссылки.
+- UTM-builder, preview endpoint и SVG share-code для шаринга ссылки.
 - Простые in-memory rate limits для API и редиректов.
+- A/B routing с весами destination URL.
+- Расширенная аналитика по устройствам, браузерам, ОС, странам и вариантам A/B.
+- Фильтры, поиск и пагинация списка ссылок.
+- API-ключи в БД со scopes и workspace-контекстом.
+- Webhooks для событий кликов через очередь доставок и простой debug HTML listing.
+- Safety hints для подозрительных destination URL.
 
 ---
 
@@ -92,6 +98,8 @@ python src/server.py
 - `SHORTENER_DB_PATH` — путь к SQLite БД (по умолчанию `shortener.db`)
 - `SHORTENER_API_KEY` — API-ключ (по умолчанию `dev-secret-key`)
 - `SHORTENER_BASE_URL` — базовый публичный URL для генерации `short_url` (опционально)
+- `SHORTENER_WORKSPACE_ID` — workspace по умолчанию для legacy API-ключа (по умолчанию `default`)
+- `SHORTENER_WEBHOOK_TIMEOUT` — timeout доставки webhook в секундах (по умолчанию `2`)
 
 Пример запуска с кастомными переменными:
 
@@ -164,7 +172,11 @@ curl http://127.0.0.1:8080/api/links/launch2026/stats \
   "clicks_by_day": [
     {"date":"2026-06-28","clicks":42}
   ],
-  "recent_clicks": []
+  "devices": [],
+  "browsers": [],
+  "operating_systems": [],
+  "countries": [],
+  "variants": []
 }
 ```
 
@@ -205,12 +217,71 @@ curl -X POST http://127.0.0.1:8080/api/links/import \
   --data-binary @links.csv
 ```
 
-### Preview и SVG-код для шаринга
+### Preview и SVG share-code для шаринга
 
 ```bash
 curl http://127.0.0.1:8080/preview/launch2026
 curl http://127.0.0.1:8080/qr/launch2026 > launch2026.svg
 ```
+
+
+### A/B routing
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/links \
+  -H 'Content-Type: application/json' \
+  -H 'X-API-Key: dev-secret-key' \
+  -d '{
+    "destination_url":"https://example.com/control",
+    "slug":"experiment",
+    "destinations":[
+      {"label":"a","url":"https://example.com/a","weight":50},
+      {"label":"b","url":"https://example.com/b","weight":50}
+    ]
+  }'
+```
+
+При редиректе сервис выбирает destination URL с учётом веса, стабильно привязывает вариант к visitor hash и сохраняет `variant_label` в аналитике.
+
+### Фильтры списка ссылок
+
+```bash
+curl 'http://127.0.0.1:8080/api/links?q=launch&limit=20&offset=0&is_active=true' \
+  -H 'X-API-Key: dev-secret-key'
+```
+
+Ответ содержит `links` и блок `pagination` с `limit`, `offset` и `total`.
+
+### API-ключи со scopes
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/keys \
+  -H 'Content-Type: application/json' \
+  -H 'X-API-Key: dev-secret-key' \
+  -d '{"name":"readonly","scopes":["links:read","stats:read"]}'
+```
+
+Созданный ключ возвращается только один раз; в SQLite хранится SHA-256 hash.
+
+### Webhooks
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/webhooks \
+  -H 'Content-Type: application/json' \
+  -H 'X-API-Key: dev-secret-key' \
+  -d '{"url":"https://example.com/hook","events":["click.created"]}'
+```
+
+Событие клика сначала попадает в очередь `webhook_deliveries`; отдельный endpoint обработки подписывает payload HMAC SHA-256 в заголовке `X-Shortener-Signature` и выполняет delivery.
+
+### Debug listing
+
+```bash
+curl http://127.0.0.1:8080/admin \
+  -H 'X-API-Key: dev-secret-key'
+```
+
+Debug listing показывает последние 50 ссылок, статус активности и safety hint; это не полноценная админ-панель.
 
 ### Пример ссылки со сроком действия
 
@@ -226,6 +297,15 @@ curl -X POST http://127.0.0.1:8080/api/links \
 ```
 
 После истечения срока действия сервис вернет `410 Gone`.
+
+
+### Известные ограничения MVP
+
+- `/qr/<slug>` пока отдаёт stdlib-only SVG share-code, а не стандартизированный сканируемый QR-код. Endpoint сохранён для обратной совместимости, но production-версии стоит подключить полноценный QR encoder.
+- In-memory rate limit подходит для локального запуска; для нескольких процессов/инстансов нужен Redis-backed implementation за тем же интерфейсом rate limiter.
+- `/admin` — это debug listing, а не полноценный dashboard с графиками и формами управления.
+- Webhook delivery вынесен из redirect path в очередь, но production-воркер/retry scheduler ещё нужно запускать отдельным процессом.
+- Raw `user_agent` не возвращается в stats по умолчанию; его можно запросить только явно через `include_recent=true&include_user_agent=true`.
 
 ---
 
