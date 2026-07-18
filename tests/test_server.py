@@ -168,6 +168,22 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(stats_body["devices"][0]["name"], "mobile")
         self.assertEqual(stats_body["countries"][0]["name"], "US")
         self.assertTrue(stats_body["variants"])
+        self.assertNotIn("recent_clicks", stats_body)
+
+        stats_recent = self.request("GET", "/api/links/ab-link/stats?include_recent=true", headers=self.api_headers())
+        recent_body = json.loads(stats_recent["body"])
+        self.assertIn("recent_clicks", recent_body)
+        self.assertNotIn("user_agent", recent_body["recent_clicks"][0])
+
+        first_variant = recent_body["recent_clicks"][0]["variant_label"]
+        repeat_redirect = self.request(
+            "GET",
+            "/ab-link",
+            headers={"HTTP_USER_AGENT": "Mozilla/5.0 (iPhone) Safari/605.1", "HTTP_CF_IPCOUNTRY": "US"},
+        )
+        self.assertTrue(repeat_redirect["status"].startswith("302"))
+        repeat_stats = self.request("GET", "/api/links/ab-link/stats?include_recent=true", headers=self.api_headers())
+        self.assertEqual(json.loads(repeat_stats["body"])["recent_clicks"][0]["variant_label"], first_variant)
 
         listed = self.request("GET", "/api/links?q=ab-link&limit=10&offset=0&is_active=true", headers=self.api_headers())
         listed_body = json.loads(listed["body"])
@@ -176,7 +192,7 @@ class ServerTest(unittest.TestCase):
 
         dashboard = self.request("GET", "/admin", headers=self.api_headers())
         self.assertTrue(dashboard["status"].startswith("200"))
-        self.assertIn(b"Links dashboard", dashboard["body"])
+        self.assertIn(b"Debug link listing", dashboard["body"])
 
     def test_api_keys_and_webhooks(self):
         key = self.request(
@@ -188,17 +204,29 @@ class ServerTest(unittest.TestCase):
         self.assertTrue(key["status"].startswith("201"))
         api_key = json.loads(key["body"])["api_key"]
 
+        invalid_key = self.request("POST", "/api/keys", {"name": "bad", "scopes": ["root"]}, self.api_headers())
+        self.assertTrue(invalid_key["status"].startswith("400"))
+
         allowed = self.request("GET", "/api/links", headers={"HTTP_X_API_KEY": api_key})
         self.assertTrue(allowed["status"].startswith("200"))
 
         denied = self.request("POST", "/api/links", {"destination_url": "https://example.com", "slug": "nope"}, {"HTTP_X_API_KEY": api_key})
-        self.assertTrue(denied["status"].startswith("401"))
+        self.assertTrue(denied["status"].startswith("403"))
 
         webhook = self.request("POST", "/api/webhooks", {"url": "https://example.com/hook", "events": ["click.created"]}, self.api_headers())
         self.assertTrue(webhook["status"].startswith("201"))
         webhook_body = json.loads(webhook["body"])
         self.assertEqual(webhook_body["events"], ["click.created"])
         self.assertTrue(webhook_body["secret"])
+
+        self.request("POST", "/api/links", {"destination_url": "https://example.com", "slug": "hooked"}, self.api_headers())
+        self.request("GET", "/hooked")
+        conn = server.db()
+        delivery = conn.execute("SELECT status, attempts, payload FROM webhook_deliveries").fetchone()
+        conn.close()
+        self.assertEqual(delivery["status"], "pending")
+        self.assertEqual(delivery["attempts"], 0)
+        self.assertIn("click.created", delivery["payload"])
 
 
 if __name__ == "__main__":

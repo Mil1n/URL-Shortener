@@ -42,16 +42,16 @@
 - Кастомный slug.
 - Поддержка `expires_at`.
 - Детекция ботов по User-Agent.
-- Метрики: `total_clicks`, `unique_clicks`, `bot_clicks`, `bot_ratio`, `top_referrers`, `clicks_by_day`, `recent_clicks`.
+- Метрики: `total_clicks`, `unique_clicks`, `bot_clicks`, `bot_ratio`, `top_referrers`, `clicks_by_day`; `recent_clicks` доступны по явному флагу.
 - Валидация slug, destination URL и `expires_at`.
 - Список, обновление, отключение ссылок и CSV-импорт.
-- UTM-builder, preview endpoint и SVG-код для шаринга ссылки.
+- UTM-builder, preview endpoint и SVG share-code для шаринга ссылки.
 - Простые in-memory rate limits для API и редиректов.
 - A/B routing с весами destination URL.
 - Расширенная аналитика по устройствам, браузерам, ОС, странам и вариантам A/B.
 - Фильтры, поиск и пагинация списка ссылок.
 - API-ключи в БД со scopes и workspace-контекстом.
-- Webhooks для событий кликов и простой HTML dashboard.
+- Webhooks для событий кликов через очередь доставок и простой debug HTML listing.
 - Safety hints для подозрительных destination URL.
 
 ---
@@ -172,7 +172,11 @@ curl http://127.0.0.1:8080/api/links/launch2026/stats \
   "clicks_by_day": [
     {"date":"2026-06-28","clicks":42}
   ],
-  "recent_clicks": []
+  "devices": [],
+  "browsers": [],
+  "operating_systems": [],
+  "countries": [],
+  "variants": []
 }
 ```
 
@@ -213,7 +217,7 @@ curl -X POST http://127.0.0.1:8080/api/links/import \
   --data-binary @links.csv
 ```
 
-### Preview и SVG-код для шаринга
+### Preview и SVG share-code для шаринга
 
 ```bash
 curl http://127.0.0.1:8080/preview/launch2026
@@ -237,7 +241,7 @@ curl -X POST http://127.0.0.1:8080/api/links \
   }'
 ```
 
-При редиректе сервис выбирает destination URL с учётом веса и сохраняет `variant_label` в аналитике.
+При редиректе сервис выбирает destination URL с учётом веса, стабильно привязывает вариант к visitor hash и сохраняет `variant_label` в аналитике.
 
 ### Фильтры списка ссылок
 
@@ -268,16 +272,16 @@ curl -X POST http://127.0.0.1:8080/api/webhooks \
   -d '{"url":"https://example.com/hook","events":["click.created"]}'
 ```
 
-Payload подписывается HMAC SHA-256 в заголовке `X-Shortener-Signature`.
+Событие клика сначала попадает в очередь `webhook_deliveries`; отдельный endpoint обработки подписывает payload HMAC SHA-256 в заголовке `X-Shortener-Signature` и выполняет delivery.
 
-### Dashboard
+### Debug listing
 
 ```bash
 curl http://127.0.0.1:8080/admin \
   -H 'X-API-Key: dev-secret-key'
 ```
 
-Dashboard показывает последние 50 ссылок, статус активности и safety hint.
+Debug listing показывает последние 50 ссылок, статус активности и safety hint; это не полноценная админ-панель.
 
 ### Пример ссылки со сроком действия
 
@@ -293,6 +297,15 @@ curl -X POST http://127.0.0.1:8080/api/links \
 ```
 
 После истечения срока действия сервис вернет `410 Gone`.
+
+
+### Известные ограничения MVP
+
+- `/qr/<slug>` пока отдаёт stdlib-only SVG share-code, а не стандартизированный сканируемый QR-код. Endpoint сохранён для обратной совместимости, но production-версии стоит подключить полноценный QR encoder.
+- In-memory rate limit подходит для локального запуска; для нескольких процессов/инстансов нужен Redis-backed implementation за тем же интерфейсом rate limiter.
+- `/admin` — это debug listing, а не полноценный dashboard с графиками и формами управления.
+- Webhook delivery вынесен из redirect path в очередь, но production-воркер/retry scheduler ещё нужно запускать отдельным процессом.
+- Raw `user_agent` не возвращается в stats по умолчанию; его можно запросить только явно через `include_recent=true&include_user_agent=true`.
 
 ---
 

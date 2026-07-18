@@ -16,20 +16,22 @@ import hashlib
 import hmac
 import html
 import io
-import ipaddress
 import json
 import os
 import random
-import re
 import secrets
 import sqlite3
 import string
-import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
 from http import HTTPStatus
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
+
+from src.analytics import classify_user_agent, country_from_environ, is_bot
+from src.ratelimit import InMemoryRateLimiter
+from src.share import share_svg
+from src.time_utils import is_expired, now_iso, parse_iso_datetime
+from src.validation import RESERVED_SLUGS, SLUG_RE, safety_status_for_url, validate_destination_url, validate_slug
 from wsgiref.simple_server import make_server
 
 
@@ -39,18 +41,12 @@ BASE_URL = os.getenv("SHORTENER_BASE_URL", "").rstrip("/")
 DEFAULT_WORKSPACE_ID = os.getenv("SHORTENER_WORKSPACE_ID", "default")
 WEBHOOK_TIMEOUT_SECONDS = float(os.getenv("SHORTENER_WEBHOOK_TIMEOUT", "2"))
 
-BOT_MARKERS = ("bot", "spider", "crawler", "headless", "preview")
-SLUG_RE = re.compile(r"^[A-Za-z0-9_-]{3,64}$")
-RESERVED_SLUGS = {"api", "health", "admin", "stats", "preview", "qr", "assets", "favicon.ico"}
 MAX_BODY_BYTES = 1_000_000
 CREATE_RATE_LIMIT = 60
 REDIRECT_RATE_LIMIT = 600
 RATE_LIMIT_WINDOW_SECONDS = 60
-_RATE_LIMITS: dict[tuple[str, str], list[float]] = {}
-
-
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+_RATE_LIMITER = InMemoryRateLimiter(RATE_LIMIT_WINDOW_SECONDS)
+_RATE_LIMITS = _RATE_LIMITER.buckets
 
 
 def db() -> sqlite3.Connection:
@@ -73,6 +69,11 @@ def init_db() -> None:
     conn = db()
     conn.executescript(
         """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS workspaces (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
@@ -145,10 +146,14 @@ def init_db() -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             webhook_id INTEGER NOT NULL,
             event TEXT NOT NULL,
+            payload TEXT NOT NULL DEFAULT '{}',
             status TEXT NOT NULL,
             response_code INTEGER,
             error TEXT,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT,
             created_at TEXT NOT NULL,
+            delivered_at TEXT,
             FOREIGN KEY(webhook_id) REFERENCES webhooks(id)
         );
 
@@ -164,9 +169,11 @@ def init_db() -> None:
     for table, additions in {
         "links": [("workspace_id", "TEXT NOT NULL DEFAULT 'default'"), ("owner_key_id", "INTEGER"), ("safety_status", "TEXT NOT NULL DEFAULT 'unchecked'")],
         "clicks": [("device", "TEXT NOT NULL DEFAULT 'unknown'"), ("browser", "TEXT NOT NULL DEFAULT 'unknown'"), ("os", "TEXT NOT NULL DEFAULT 'unknown'"), ("country", "TEXT NOT NULL DEFAULT 'unknown'"), ("variant_label", "TEXT")],
+        "webhook_deliveries": [("payload", "TEXT NOT NULL DEFAULT '{}'"), ("attempts", "INTEGER NOT NULL DEFAULT 0"), ("next_attempt_at", "TEXT"), ("delivered_at", "TEXT")],
     }.items():
         for column, definition in additions:
             ensure_column(conn, table, column, definition)
+    conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(?,?)", (1, now_iso()))
     conn.commit()
     conn.close()
 
@@ -228,21 +235,23 @@ def require_api_key(environ, scope: str | None = None) -> dict | None:
     return context
 
 
+def auth_error(environ, scope: str | None = None) -> HTTPStatus:
+    context = api_context(environ)
+    if not context:
+        return HTTPStatus.UNAUTHORIZED
+    scopes = context["scopes"]
+    if scope and "*" not in scopes and scope not in scopes:
+        return HTTPStatus.FORBIDDEN
+    return HTTPStatus.UNAUTHORIZED
+
+
 def client_ip(environ) -> str:
     forwarded_for = environ.get("HTTP_X_FORWARDED_FOR", "").split(",")[0].strip()
     return forwarded_for or environ.get("REMOTE_ADDR", "0.0.0.0")
 
 
 def rate_limited(scope: str, key: str, limit: int) -> bool:
-    now = time.monotonic()
-    bucket_key = (scope, key)
-    bucket = [ts for ts in _RATE_LIMITS.get(bucket_key, []) if now - ts < RATE_LIMIT_WINDOW_SECONDS]
-    if len(bucket) >= limit:
-        _RATE_LIMITS[bucket_key] = bucket
-        return True
-    bucket.append(now)
-    _RATE_LIMITS[bucket_key] = bucket
-    return False
+    return _RATE_LIMITER.is_limited(scope, key, limit)
 
 
 def parse_json_body(environ) -> dict:
@@ -261,56 +270,6 @@ def parse_json_body(environ) -> dict:
     return payload
 
 
-def parse_iso_datetime(value: str | None) -> str | None:
-    if not value:
-        return None
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc).isoformat()
-
-
-def is_expired(expires_at: str | None) -> bool:
-    if not expires_at:
-        return False
-    return datetime.fromisoformat(expires_at) < datetime.now(timezone.utc)
-
-
-def validate_slug(slug: str) -> str | None:
-    if not SLUG_RE.match(slug):
-        return "slug_must_match_[A-Za-z0-9_-]{3,64}"
-    if slug.lower() in RESERVED_SLUGS:
-        return "slug_reserved"
-    return None
-
-
-def is_private_host(hostname: str | None) -> bool:
-    if not hostname:
-        return False
-    try:
-        ip = ipaddress.ip_address(hostname)
-    except ValueError:
-        return hostname.lower() in {"localhost"} or hostname.endswith(".local")
-    return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved
-
-
-def safety_status_for_url(url: str) -> str:
-    hostname = (urlparse(url).hostname or "").lower()
-    suspicious_markers = ("xn--", "phish", "malware", "login-secure", "verify-account")
-    return "suspicious" if any(marker in hostname for marker in suspicious_markers) else "unchecked"
-
-
-def validate_destination_url(url: str) -> str | None:
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        return "destination_url_must_be_http_or_https"
-    if parsed.username or parsed.password:
-        return "destination_url_credentials_not_allowed"
-    if is_private_host(parsed.hostname):
-        return "destination_url_private_hosts_not_allowed"
-    return None
-
-
 def add_utm_params(url: str, payload: dict) -> str:
     utm = {key: str(payload[key]).strip() for key in ("utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term") if payload.get(key)}
     if not utm:
@@ -319,35 +278,6 @@ def add_utm_params(url: str, payload: dict) -> str:
     query = dict(parse_qsl(parsed.query, keep_blank_values=True))
     query.update(utm)
     return urlunparse(parsed._replace(query=urlencode(query)))
-
-
-def is_bot(ua: str | None) -> bool:
-    if not ua:
-        return False
-    lu = ua.lower()
-    return any(marker in lu for marker in BOT_MARKERS)
-
-
-def classify_user_agent(ua: str | None) -> dict[str, str]:
-    value = (ua or "").lower()
-    device = "mobile" if any(token in value for token in ("mobile", "iphone", "android")) else "desktop"
-    if "ipad" in value or "tablet" in value:
-        device = "tablet"
-    browser = "unknown"
-    for marker, name in (("edg/", "edge"), ("chrome/", "chrome"), ("firefox/", "firefox"), ("safari/", "safari")):
-        if marker in value:
-            browser = name
-            break
-    os_name = "unknown"
-    for marker, name in (("windows", "windows"), ("mac os", "macos"), ("iphone", "ios"), ("ipad", "ios"), ("android", "android"), ("linux", "linux")):
-        if marker in value:
-            os_name = name
-            break
-    return {"device": device, "browser": browser, "os": os_name}
-
-
-def country_from_environ(environ) -> str:
-    return (environ.get("HTTP_CF_IPCOUNTRY") or environ.get("HTTP_X_COUNTRY") or "unknown").upper()
 
 
 def public_short_url(environ, slug: str) -> str:
@@ -380,50 +310,6 @@ def link_payload(environ, row: sqlite3.Row, conn: sqlite3.Connection | None = No
     if destinations:
         payload["destinations"] = destinations
     return payload
-
-
-def qr_svg(data: str) -> str:
-    """Return a deterministic SVG share code for the short URL.
-
-    The project intentionally stays stdlib-only in this environment, so this
-    renderer creates a compact, QR-like matrix from a cryptographic digest.
-    It is suitable for visual sharing placeholders; production deployments can
-    swap this function for a standards-compliant QR encoder without changing
-    the endpoint contract.
-    """
-    digest = hashlib.sha256(data.encode("utf-8")).digest()
-    size = 29
-    cell = 8
-    quiet = 4
-    modules = [[False for _ in range(size)] for _ in range(size)]
-
-    def finder(x: int, y: int) -> None:
-        for dy in range(7):
-            for dx in range(7):
-                border = dx in {0, 6} or dy in {0, 6}
-                center = 2 <= dx <= 4 and 2 <= dy <= 4
-                modules[y + dy][x + dx] = border or center
-
-    finder(0, 0)
-    finder(size - 7, 0)
-    finder(0, size - 7)
-    bit_index = 0
-    for y in range(size):
-        for x in range(size):
-            in_finder = (x < 7 and y < 7) or (x >= size - 7 and y < 7) or (x < 7 and y >= size - 7)
-            if in_finder:
-                continue
-            byte = digest[(bit_index // 8) % len(digest)]
-            modules[y][x] = bool(byte & (1 << (bit_index % 8)))
-            bit_index += 1
-    width = (size + quiet * 2) * cell
-    rects = []
-    for y, row in enumerate(modules):
-        for x, filled in enumerate(row):
-            if filled:
-                rects.append(f'<rect x="{(x + quiet) * cell}" y="{(y + quiet) * cell}" width="{cell}" height="{cell}"/>')
-    safe_data = html.escape(data, quote=True)
-    return f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{width}" viewBox="0 0 {width} {width}" role="img" aria-label="Share code for {safe_data}"><metadata>{safe_data}</metadata><rect width="100%" height="100%" fill="white"/><g fill="black">{"".join(rects)}</g></svg>'
 
 
 def normalized_destinations(payload: dict, primary_url: str) -> list[dict]:
@@ -487,12 +373,13 @@ def create_link(environ, start_response, payload: dict, context: dict):
     return json_response(start_response, HTTPStatus.CREATED, response)
 
 
-def choose_destination(conn: sqlite3.Connection, link: sqlite3.Row) -> tuple[str, str | None]:
+def choose_destination(conn: sqlite3.Connection, link: sqlite3.Row, visitor_key: str) -> tuple[str, str | None]:
     variants = conn.execute("SELECT label, destination_url, weight FROM link_destinations WHERE link_id=?", (link["id"],)).fetchall()
     if not variants:
         return link["destination_url"], None
     total = sum(max(1, row["weight"]) for row in variants)
-    pick = secrets.randbelow(total) + 1
+    seed = hashlib.sha256(f"{link['id']}|{visitor_key}".encode("utf-8")).hexdigest()
+    pick = (int(seed, 16) % total) + 1
     upto = 0
     for row in variants:
         upto += max(1, row["weight"])
@@ -502,18 +389,46 @@ def choose_destination(conn: sqlite3.Connection, link: sqlite3.Row) -> tuple[str
     return last["destination_url"], last["label"]
 
 
-def webhook_event(conn: sqlite3.Connection, workspace_id: str, event: str, payload: dict) -> None:
+def enqueue_webhook_events(conn: sqlite3.Connection, workspace_id: str, event: str, payload: dict) -> int:
     hooks = conn.execute("SELECT * FROM webhooks WHERE workspace_id=? AND is_active=1", (workspace_id,)).fetchall()
-    body = json.dumps({"event": event, "payload": payload}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    body = json.dumps({"event": event, "payload": payload}, ensure_ascii=False, separators=(",", ":"))
+    queued = 0
     for hook in hooks:
         events = {item.strip() for item in hook["events"].split(",")}
         if event not in events and "*" not in events:
             continue
-        signature = hmac.new(hook["secret"].encode("utf-8"), body, hashlib.sha256).hexdigest()
-        request = urllib.request.Request(hook["url"], data=body, method="POST", headers={"Content-Type": "application/json", "X-Shortener-Signature": signature})
+        conn.execute(
+            "INSERT INTO webhook_deliveries(webhook_id, event, payload, status, next_attempt_at, created_at) VALUES(?,?,?,?,?,?)",
+            (hook["id"], event, body, "pending", now_iso(), now_iso()),
+        )
+        queued += 1
+    return queued
+
+
+def process_webhook_deliveries(conn: sqlite3.Connection, limit: int = 20) -> dict:
+    rows = conn.execute(
+        """
+        SELECT d.*, w.url, w.secret
+        FROM webhook_deliveries d
+        JOIN webhooks w ON w.id=d.webhook_id
+        WHERE d.status IN ('pending','failed')
+          AND (d.next_attempt_at IS NULL OR d.next_attempt_at<=?)
+          AND d.attempts < 3
+        ORDER BY d.id
+        LIMIT ?
+        """,
+        (now_iso(), limit),
+    ).fetchall()
+    delivered = 0
+    failed = 0
+    for row in rows:
+        body = row["payload"].encode("utf-8")
+        signature = hmac.new(row["secret"].encode("utf-8"), body, hashlib.sha256).hexdigest()
+        request = urllib.request.Request(row["url"], data=body, method="POST", headers={"Content-Type": "application/json", "X-Shortener-Signature": signature})
         status = "delivered"
         code = None
         error = None
+        delivered_at = now_iso()
         try:
             with urllib.request.urlopen(request, timeout=WEBHOOK_TIMEOUT_SECONDS) as response:
                 code = response.status
@@ -521,18 +436,24 @@ def webhook_event(conn: sqlite3.Connection, workspace_id: str, event: str, paylo
             status = "failed"
             code = exc.code
             error = str(exc)
+            delivered_at = None
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             status = "failed"
             error = str(exc)
+            delivered_at = None
+        attempts = row["attempts"] + 1
+        next_attempt_at = None if status == "delivered" or attempts >= 3 else now_iso()
         conn.execute(
-            "INSERT INTO webhook_deliveries(webhook_id, event, status, response_code, error, created_at) VALUES(?,?,?,?,?,?)",
-            (hook["id"], event, status, code, error, now_iso()),
+            "UPDATE webhook_deliveries SET status=?, response_code=?, error=?, attempts=?, next_attempt_at=?, delivered_at=? WHERE id=?",
+            (status, code, error, attempts, next_attempt_at, delivered_at, row["id"]),
         )
-
+        delivered += 1 if status == "delivered" else 0
+        failed += 1 if status == "failed" else 0
+    return {"processed": len(rows), "delivered": delivered, "failed": failed}
 
 def dashboard(environ, start_response):
     if not require_api_key(environ, "links:read"):
-        return json_response(start_response, HTTPStatus.UNAUTHORIZED, {"error": "invalid_api_key"})
+        return json_response(start_response, auth_error(environ, "links:read"), {"error": "invalid_api_key"})
     conn = db()
     rows = conn.execute("SELECT slug, destination_url, created_at, is_active, safety_status FROM links ORDER BY id DESC LIMIT 50").fetchall()
     conn.close()
@@ -540,7 +461,7 @@ def dashboard(environ, start_response):
         f"<tr><td><a href='/{html.escape(row['slug'])}'>{html.escape(row['slug'])}</a></td><td>{html.escape(row['destination_url'])}</td><td>{html.escape(row['created_at'])}</td><td>{'active' if row['is_active'] else 'disabled'}</td><td>{html.escape(row['safety_status'])}</td></tr>"
         for row in rows
     )
-    page = f"""<!doctype html><html><head><meta charset='utf-8'><title>URL Shortener Admin</title><style>body{{font-family:system-ui;margin:2rem}}table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #ddd;padding:.6rem;text-align:left}}</style></head><body><h1>Links dashboard</h1><p>Latest 50 links with status and safety hints.</p><table><thead><tr><th>Slug</th><th>Destination</th><th>Created</th><th>Status</th><th>Safety</th></tr></thead><tbody>{items}</tbody></table></body></html>"""
+    page = f"""<!doctype html><html><head><meta charset='utf-8'><title>URL Shortener Admin</title><style>body{{font-family:system-ui;margin:2rem}}table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #ddd;padding:.6rem;text-align:left}}</style></head><body><h1>Debug link listing</h1><p>Latest 50 links for quick inspection; this is not a full admin dashboard yet.</p><table><thead><tr><th>Slug</th><th>Destination</th><th>Created</th><th>Status</th><th>Safety</th></tr></thead><tbody>{items}</tbody></table></body></html>"""
     return text_response(start_response, HTTPStatus.OK, page, "text/html; charset=utf-8")
 
 
@@ -556,9 +477,10 @@ def app(environ, start_response):
         return dashboard(environ, start_response)
 
     if path == "/api/keys" and method in {"GET", "POST"}:
-        context = require_api_key(environ, "keys:write" if method == "POST" else "keys:read")
+        scope = "keys:write" if method == "POST" else "keys:read"
+        context = require_api_key(environ, scope)
         if not context:
-            return json_response(start_response, HTTPStatus.UNAUTHORIZED, {"error": "invalid_api_key"})
+            return json_response(start_response, auth_error(environ, scope), {"error": "invalid_api_key"})
         conn = db()
         if method == "GET":
             rows = conn.execute("SELECT id, workspace_id, name, scopes, created_at, expires_at, revoked_at, last_used_at FROM api_keys WHERE workspace_id=? ORDER BY id DESC", (context["workspace_id"],)).fetchall()
@@ -571,17 +493,33 @@ def app(environ, start_response):
             conn.close()
             return json_response(start_response, HTTPStatus.BAD_REQUEST, {"error": "invalid_payload"})
         raw_key = "sk_" + secrets.token_urlsafe(32)
-        scopes = ",".join(body.get("scopes") or ["links:read", "links:write", "stats:read"])
+        requested_scopes = body.get("scopes") or ["links:read", "links:write", "stats:read"]
+        allowed_scopes = {"links:read", "links:write", "stats:read", "keys:read", "keys:write", "webhooks:read", "webhooks:write"}
+        if not isinstance(requested_scopes, list) or any(scope not in allowed_scopes for scope in requested_scopes):
+            conn.close()
+            return json_response(start_response, HTTPStatus.BAD_REQUEST, {"error": "invalid_scopes"})
+        scopes = ",".join(requested_scopes)
         conn.execute("INSERT INTO api_keys(workspace_id, name, key_hash, scopes, created_at, expires_at) VALUES(?,?,?,?,?,?)", (context["workspace_id"], str(body.get("name") or "API key"), hash_key(raw_key), scopes, now_iso(), expires_at))
         conn.commit()
         key_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
         conn.close()
         return json_response(start_response, HTTPStatus.CREATED, {"id": key_id, "api_key": raw_key, "scopes": scopes.split(",")})
 
-    if path == "/api/webhooks" and method in {"GET", "POST"}:
-        context = require_api_key(environ, "webhooks:write" if method == "POST" else "webhooks:read")
+    if path == "/api/webhooks/deliveries/process" and method == "POST":
+        context = require_api_key(environ, "webhooks:write")
         if not context:
-            return json_response(start_response, HTTPStatus.UNAUTHORIZED, {"error": "invalid_api_key"})
+            return json_response(start_response, auth_error(environ, "webhooks:write"), {"error": "invalid_api_key"})
+        conn = db()
+        result = process_webhook_deliveries(conn)
+        conn.commit()
+        conn.close()
+        return json_response(start_response, HTTPStatus.OK, result)
+
+    if path == "/api/webhooks" and method in {"GET", "POST"}:
+        scope = "webhooks:write" if method == "POST" else "webhooks:read"
+        context = require_api_key(environ, scope)
+        if not context:
+            return json_response(start_response, auth_error(environ, scope), {"error": "invalid_api_key"})
         conn = db()
         if method == "GET":
             rows = conn.execute("SELECT id, url, events, is_active, created_at FROM webhooks WHERE workspace_id=? ORDER BY id DESC", (context["workspace_id"],)).fetchall()
@@ -606,9 +544,10 @@ def app(environ, start_response):
         return json_response(start_response, HTTPStatus.CREATED, {"id": hook_id, "url": url, "events": events.split(","), "secret": secret})
 
     if path == "/api/links" and method in {"GET", "POST"}:
-        context = require_api_key(environ, "links:write" if method == "POST" else "links:read")
+        scope = "links:write" if method == "POST" else "links:read"
+        context = require_api_key(environ, scope)
         if not context:
-            return json_response(start_response, HTTPStatus.UNAUTHORIZED, {"error": "invalid_api_key"})
+            return json_response(start_response, auth_error(environ, scope), {"error": "invalid_api_key"})
         if rate_limited("api", client_ip(environ), CREATE_RATE_LIMIT):
             return json_response(start_response, HTTPStatus.TOO_MANY_REQUESTS, {"error": "rate_limited"})
         if method == "GET":
@@ -646,7 +585,7 @@ def app(environ, start_response):
     if path == "/api/links/import" and method == "POST":
         context = require_api_key(environ, "links:write")
         if not context:
-            return json_response(start_response, HTTPStatus.UNAUTHORIZED, {"error": "invalid_api_key"})
+            return json_response(start_response, auth_error(environ, "links:write"), {"error": "invalid_api_key"})
         try:
             size = int(environ.get("CONTENT_LENGTH") or 0)
             raw = environ["wsgi.input"].read(size).decode("utf-8")
@@ -668,9 +607,10 @@ def app(environ, start_response):
         return json_response(start_response, HTTPStatus.CREATED if created else HTTPStatus.BAD_REQUEST, {"created": created, "errors": errors})
 
     if path.startswith("/api/links/"):
-        context = require_api_key(environ, "stats:read" if path.endswith("/stats") else "links:write")
+        scope = "stats:read" if path.endswith("/stats") else "links:write"
+        context = require_api_key(environ, scope)
         if not context:
-            return json_response(start_response, HTTPStatus.UNAUTHORIZED, {"error": "invalid_api_key"})
+            return json_response(start_response, auth_error(environ, scope), {"error": "invalid_api_key"})
         parts = path.strip("/").split("/")
         slug = parts[2] if len(parts) >= 3 else ""
         conn = db()
@@ -696,8 +636,13 @@ def app(environ, start_response):
                 return [dict(item) for item in conn.execute(f"SELECT COALESCE(NULLIF({column},''),?) AS name, COUNT(*) AS clicks FROM clicks WHERE {where} GROUP BY 1 ORDER BY clicks DESC LIMIT 10", (fallback, *values)).fetchall()]
             referrers = conn.execute(f"SELECT COALESCE(NULLIF(referrer,''),'direct') AS referrer, COUNT(*) AS clicks FROM clicks WHERE {where} GROUP BY 1 ORDER BY clicks DESC LIMIT 10", values).fetchall()
             daily = conn.execute(f"SELECT substr(ts,1,10) AS date, COUNT(*) AS clicks FROM clicks WHERE {where} GROUP BY 1 ORDER BY date", values).fetchall()
-            recent = conn.execute(f"SELECT ts, referrer, user_agent, is_bot, device, browser, os, country, variant_label FROM clicks WHERE {where} ORDER BY id DESC LIMIT 10", values).fetchall()
-            payload = {"slug": slug, "total_clicks": total, "unique_clicks": unique, "bot_clicks": bots, "bot_ratio": round(bots / total, 4) if total else 0, "top_referrers": [dict(item) for item in referrers], "clicks_by_day": [dict(item) for item in daily], "devices": grouped("device"), "browsers": grouped("browser"), "operating_systems": grouped("os"), "countries": grouped("country"), "variants": grouped("variant_label", "control"), "recent_clicks": [dict(item) for item in recent]}
+            payload = {"slug": slug, "total_clicks": total, "unique_clicks": unique, "bot_clicks": bots, "bot_ratio": round(bots / total, 4) if total else 0, "top_referrers": [dict(item) for item in referrers], "clicks_by_day": [dict(item) for item in daily], "devices": grouped("device"), "browsers": grouped("browser"), "operating_systems": grouped("os"), "countries": grouped("country"), "variants": grouped("variant_label", "control")}
+            if query.get("include_recent", ["false"])[0].lower() in {"1", "true", "yes"}:
+                columns = "ts, referrer, is_bot, device, browser, os, country, variant_label"
+                if query.get("include_user_agent", ["false"])[0].lower() in {"1", "true", "yes"}:
+                    columns += ", user_agent"
+                recent = conn.execute(f"SELECT {columns} FROM clicks WHERE {where} ORDER BY id DESC LIMIT 10", values).fetchall()
+                payload["recent_clicks"] = [dict(item) for item in recent]
             conn.close()
             return json_response(start_response, HTTPStatus.OK, payload)
         if len(parts) == 3 and method == "PATCH":
@@ -752,7 +697,7 @@ def app(environ, start_response):
         conn.close()
         if not row:
             return text_response(start_response, HTTPStatus.NOT_FOUND, "Not found")
-        body = qr_svg(public_short_url(environ, slug)).encode("utf-8")
+        body = share_svg(public_short_url(environ, slug)).encode("utf-8")
         start_response("200 OK", [("Content-Type", "image/svg+xml; charset=utf-8"), ("Content-Length", str(len(body))), ("Content-Disposition", f'inline; filename="{slug}.svg"')])
         return [body]
 
@@ -782,15 +727,15 @@ def app(environ, start_response):
         if is_expired(link["expires_at"]):
             conn.close()
             return text_response(start_response, HTTPStatus.GONE, "Link expired")
-        destination_url, variant_label = choose_destination(conn, link)
         ip = client_ip(environ)
         ua = environ.get("HTTP_USER_AGENT", "")
         ref = environ.get("HTTP_REFERER", "")
         ua_info = classify_user_agent(ua)
         ip_hash = hashlib.sha256(f"{ip}|{ua}".encode("utf-8")).hexdigest()[:16]
+        destination_url, variant_label = choose_destination(conn, link, ip_hash)
         bot = 1 if is_bot(ua) else 0
         conn.execute("INSERT INTO clicks(link_id, ts, ip_hash, user_agent, referrer, is_bot, device, browser, os, country, variant_label) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (link["id"], now_iso(), ip_hash, ua, ref, bot, ua_info["device"], ua_info["browser"], ua_info["os"], country_from_environ(environ), variant_label))
-        webhook_event(conn, link["workspace_id"], "click.created", {"slug": slug, "destination_url": destination_url, "variant_label": variant_label, "is_bot": bool(bot), "ts": now_iso()})
+        enqueue_webhook_events(conn, link["workspace_id"], "click.created", {"slug": slug, "destination_url": destination_url, "variant_label": variant_label, "is_bot": bool(bot), "ts": now_iso()})
         conn.commit()
         conn.close()
         start_response("302 Found", [("Location", destination_url)])
